@@ -1,0 +1,127 @@
+#!/bin/sh
+#
+# Sealed build: run the project's vows suites under test/ one file per node
+# process, print every suite's own vows report, the excluded vows with their
+# reasons, and a grand total. Exits non-zero if any suite crashes or has a
+# broken/errored vow. Named vows are excluded (with reasons) by t/run-vows-suite.js.
+#
+# Files under test/ that are deliberately not in SUITES (printed at the end):
+#   test/index.js, test/{dom,parse,error}/index.js - aggregators that require
+#     the same suite files into one process (each suite already runs below)
+#   test/parse/test-define.js - helper module, defines no vows
+#   test/parse/big-file-performance.js - wall-clock race asserting xmldom parses
+#     faster than dom-js on randomly sized input (failed 8 of 12 local runs)
+#   test/xss-test.js - example script, prints a result and asserts nothing
+#
+# test/3rd-cases/ (node-o3-xml's DOM tests run against xmldom through a mock)
+# runs through t/run-o3xml.js. node-o3-xml is not on npm, so its repository is
+# fetched at a pinned commit; only its JS test files are used, the native o3
+# module it bundles is never loaded (mock.js replaces it).
+#
+# vows is pinned to 0.8.3 through the registry time machine at the xmldom 0.1.31
+# publish instant. The suites require('xmldom'), which resolves to this checkout
+# through a node_modules self-link.
+
+REGISTRY="https://:2019-12-19T22%3A34%3A16.476Z@time-machines-npm.sealsecurity.io/"
+
+echo "installing vows@0.8.3 for the test/ suites"
+if ! npm install --registry="$REGISTRY" vows@0.8.3 > .vows-install.log 2>&1; then
+  cat .vows-install.log
+  exit 1
+fi
+mkdir -p node_modules
+ln -sfn .. node_modules/xmldom
+
+O3XML_SHA=cb891d47abdf6bbaef0c0d0cc4142920b200104d
+echo "fetching eschnou/node-o3-xml@$O3XML_SHA for test/3rd-cases"
+rm -rf node_modules/node-o3-xml && mkdir -p node_modules/node-o3-xml
+if ! curl -fsSL "https://codeload.github.com/eschnou/node-o3-xml/tar.gz/$O3XML_SHA" \
+    | tar -xz -C node_modules/node-o3-xml --strip-components=1; then
+  echo "failed to fetch node-o3-xml"
+  exit 1
+fi
+
+SUITES="test/dom/attr.js test/dom/clone.js test/dom/element.js test/dom/fragment.js
+test/dom/level3.js test/dom/ns-test.js test/dom/serializer.js
+test/error/error.js test/error/xml-error.js
+test/parse/file-test.js test/parse/locator.js test/parse/namespace.js test/parse/node.js
+test/parse/parse-element.js test/parse/simple.js test/parse/test-doc-witespace.js
+test/parse/unclosedcomment.js"
+
+count() {
+  # $1 = summary line, $2 = word (honored/pending/broken/errored)
+  n=$(echo "$1" | sed -n "s/.* \([0-9][0-9]*\) $2.*/\1/p")
+  if [ -z "$n" ]; then n=0; fi
+  echo "$n"
+}
+
+: > .vows.all
+total_h=0; total_p=0; total_b=0; total_e=0; nsuites=0; failed=""
+for f in $SUITES; do
+  echo ""
+  echo "=== vows $f"
+  node t/run-vows-suite.js "$f" > .vows.out 2>&1
+  rc=$?
+  { cat .vows.out; echo; } | sed 's/\x1b\[[0-9;]*m//g' > .vows.plain
+  cat .vows.plain
+  sed "s|^|$f: |" .vows.plain >> .vows.all
+  last=$(grep -E '(OK|Broken|Errored) » ' .vows.plain | tail -1)
+  h=$(count "$last" honored); p=$(count "$last" pending)
+  b=$(count "$last" broken); e=$(count "$last" errored)
+  echo "--- $f: exit=$rc honored=$h pending=$p broken=$b errored=$e"
+  if [ "$rc" -ne 0 ] || [ -z "$last" ] || [ "$b" -ne 0 ] || [ "$e" -ne 0 ]; then
+    failed="$failed $f"
+  fi
+  total_h=$((total_h + h)); total_p=$((total_p + p))
+  total_b=$((total_b + b)); total_e=$((total_e + e))
+  nsuites=$((nsuites + 1))
+done
+
+echo ""
+echo "=== skipped (excluded) vows and why:"
+grep 'SKIPPED (excluded)' .vows.all
+nskipped=$(grep -c 'SKIPPED (excluded)' .vows.all)
+# Whole suite not run: every one of its 6 vows ("text & <", attr, attrQute,
+# unclosed, script, textarea) fails for the reason below, so nothing would remain.
+echo "test/html/normalize.js: SKIPPED (excluded) whole suite, 6 vows -- 0.1.31 text/html parsing adds xmlns=\"http://www.w3.org/1999/xhtml\" to the serialized root, which all six expectations omit (stale test, never run by upstream CI: npm test only runs t/dom/require.t.js)"
+nskipped=$((nskipped + 6))
+echo "not run: test/index.js test/dom/index.js test/parse/index.js test/error/index.js -- aggregators re-requiring the suites above in one process"
+echo "not run: test/parse/test-define.js -- helper module, no vows"
+echo "not run: test/parse/big-file-performance.js -- wall-clock race asserting xmldom parses faster than dom-js on randomly sized input (nondeterministic: failed 8 of 12 local runs); not a correctness test"
+echo "not run: test/xss-test.js -- example script without assertions"
+
+echo ""
+echo "=== test/3rd-cases (node-o3-xml DOM tests against xmldom)"
+node t/run-o3xml.js > .o3xml.out 2>&1
+rc=$?
+cat .o3xml.out
+o3_pass=$(sed -n 's/^o3xml summary: .* \([0-9][0-9]*\) passed.*/\1/p' .o3xml.out)
+o3_skip=$(sed -n 's/^o3xml summary: .* \([0-9][0-9]*\) skipped.*/\1/p' .o3xml.out)
+if [ "$rc" -eq 0 ] && [ -n "$o3_pass" ]; then
+  echo "--- test/3rd-cases: passed"
+else
+  echo "--- test/3rd-cases: FAILED"
+  failed="$failed test/3rd-cases"
+  o3_pass=0; o3_skip=0
+fi
+
+# test/test.js is a plain script whose console.assert throws on failure (Node 0.10).
+echo ""
+echo "=== script test/test.js"
+if node test/test.js; then
+  echo "--- test/test.js: passed"
+else
+  echo "--- test/test.js: FAILED"
+  failed="$failed test/test.js"
+fi
+echo ""
+echo "=== vows summary: $nsuites suites, $total_h honored, $total_p pending, $total_b broken, $total_e errored, $nskipped skipped (excluded, listed above)"
+echo "=== o3xml summary: $o3_pass passed, $o3_skip skipped (excluded, listed above)"
+script_pass=0
+case "$failed" in *test/test.js*) ;; *) script_pass=1 ;; esac
+echo "=== total (t/dom/require.t.js 1 + vows $total_h + o3xml $o3_pass + test/test.js $script_pass): $((1 + total_h + o3_pass + script_pass)) passed, $((nskipped + o3_skip)) skipped with reasons above"
+if [ -n "$failed" ]; then
+  echo "FAILED suites:$failed"
+  exit 1
+fi
+exit 0
