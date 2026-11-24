@@ -44,7 +44,7 @@ fi
 SUITES="test/dom/attr.js test/dom/cdata-section.js test/dom/clone.js test/dom/deep-tree.js test/dom/document.js test/dom/element.js test/dom/fragment.js
 test/dom/level3.js test/dom/ns-test.js test/dom/processing-instruction.js test/dom/prototype-pollution.js test/dom/serializer.js
 test/error/duplicate-attribute.js test/error/error.js test/error/parse-error.js test/error/xml-error.js
-test/parse/doctype.js test/parse/end-tag-residue.js test/parse/file-test.js test/parse/locator.js test/parse/multiple-root.js test/parse/namespace.js test/parse/node.js
+test/parse/attribute-complexity.js test/parse/doctype.js test/parse/end-tag-residue.js test/parse/file-test.js test/parse/locator.js test/parse/multiple-root.js test/parse/namespace.js test/parse/node.js
 test/parse/parse-element.js test/parse/prototype-pollution.js test/parse/simple.js test/parse/test-doc-witespace.js
 test/parse/unclosedcomment.js"
 
