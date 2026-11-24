@@ -11,6 +11,9 @@ var INVALID_STATE_ERR = 11;
 // GHSA-j759-j44w-7fr8 proof of concept: closes the comment and injects an element
 var COMMENT_PAYLOAD = '--><injected attr="1"/><!--';
 
+// GHSA-27p8-2357-5qqv proof of concept: closes the DOCTYPE through its name and injects a script
+var DOCTYPE_NAME_PAYLOAD = 'html><script xmlns="http://www.w3.org/1999/xhtml">alert(1)</script';
+
 wows.describe('XML Serializer').addBatch({
   'text node containing "]]>"': function() {
     var doc = new DOMParser().parseFromString('<test/>', 'text/xml');
@@ -318,6 +321,169 @@ wows.describe('XML Serializer').addBatch({
     assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, null),
       '<root><!--hello-->world--></root>');
   }
+}).addBatch({
+  // CVE-2026-41674: the DocumentType publicId, systemId and internalSubset were serialized
+  // as is, even with requireWellFormed: true, so a crafted value could close the DOCTYPE
+  // declaration early and inject markup (e.g. an entity declaration).
+  // https://github.com/xmldom/xmldom/security/advisories/GHSA-f6ww-3ggp-fr8h
+  'default: DocumentType with invalid publicId serializes verbatim - no throw': function() {
+    var doc = createDoctypeDocument('name', '"invalid<char"', '');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc), '<!DOCTYPE name PUBLIC "invalid<char"><root/>');
+  },
+  'requireWellFormed: true on DocumentType with invalid publicId throws InvalidStateError': function() {
+    assertDoctypeRejected(createDoctypeDocument('name', '"invalid<char"', ''));
+  },
+  'requireWellFormed: true on DocumentType with invalid systemId throws InvalidStateError': function() {
+    assertDoctypeRejected(createDoctypeDocument('name', '', 'no-quotes-around-this'));
+  },
+  'requireWellFormed: true on DocumentType with "]>" in internalSubset throws InvalidStateError': function() {
+    var doc = createDoctypeDocument('name', '', '');
+    doc.doctype.internalSubset = ']><injected/>';
+    assertDoctypeRejected(doc);
+  },
+  'requireWellFormed: true on DocumentType with valid fields does not throw': function() {
+    var doc = createDoctypeDocument('html', '"-//W3C//DTD HTML 4.01//EN"', '"http://www.w3.org/TR/html4/strict.dtd"');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }),
+      '<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd"><root/>');
+  },
+  'direct property write: setting invalid publicId then requireWellFormed: true throws InvalidStateError': function() {
+    var doc = createDoctypeDocument('name', '"-//W3C//DTD//EN"', '');
+    doc.doctype.publicId = '"invalid<char"';
+    assertDoctypeRejected(doc);
+  }
+}).addBatch({
+  // the injection vectors: each payload is emitted as live markup by default and is rejected
+  // with requireWellFormed: true
+  'systemId injecting an entity declaration (XXE) throws with requireWellFormed: true': function() {
+    var doc = createDoctypeDocument('root', '', '"x.dtd" [<!ENTITY xxe SYSTEM "file:///etc/passwd">]');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc),
+      '<!DOCTYPE root SYSTEM "x.dtd" [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root/>');
+    assertDoctypeRejected(doc);
+  },
+  'publicId closing the declaration early throws with requireWellFormed: true': function() {
+    var doc = createDoctypeDocument('root', '"-//X//EN"><injected/', '');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc), '<!DOCTYPE root PUBLIC "-//X//EN"><injected/><root/>');
+    assertDoctypeRejected(doc);
+  },
+  'systemId after a publicId closing the declaration early throws with requireWellFormed: true': function() {
+    var doc = createDoctypeDocument('root', '"-//X//EN"', '"x.dtd"><injected/');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc), '<!DOCTYPE root PUBLIC "-//X//EN" "x.dtd"><injected/><root/>');
+    assertDoctypeRejected(doc);
+  },
+  'internalSubset closing the declaration early throws with requireWellFormed: true': function() {
+    var doc = createDoctypeDocument('root', '', '');
+    doc.doctype.internalSubset = '<!ENTITY a "b">]><injected/><!--';
+    assert.strictEqual(new XMLSerializer().serializeToString(doc),
+      '<!DOCTYPE root [<!ENTITY a "b">]><injected/><!--]><root/>');
+    assertDoctypeRejected(doc);
+  },
+  'a valid literal followed by a line terminator and a payload throws (GHSA-vr34-hp96-76pp)': function() {
+    var terminators = [String.fromCharCode(0x0A), String.fromCharCode(0x0D), String.fromCharCode(0x2028), String.fromCharCode(0x2029)];
+    for (var i = 0; i < terminators.length; i++) {
+      var lt = terminators[i];
+      assertDoctypeRejected(createDoctypeDocument('html', '"valid pubid"' + lt + '"><!ENTITY xxe SYSTEM "file:///etc/passwd">', ''));
+      assertDoctypeRejected(createDoctypeDocument('html', '', '"valid.dtd"' + lt + '[<!ENTITY xxe SYSTEM "file:///etc/passwd">]'));
+      assertDoctypeRejected(createDoctypeDocument('html', '"-//X//EN"', '"valid.dtd"' + lt + '><injected/'));
+    }
+  },
+  'a publicId with a quote character inside throws with requireWellFormed: true': function() {
+    // a single quoted PubidLiteral can not contain a single quote, no PubidLiteral a double quote
+    assertDoctypeRejected(createDoctypeDocument('root', '\'it\'s\'', ''));
+    assertDoctypeRejected(createDoctypeDocument('root', '"a"b"', ''));
+    assertDoctypeRejected(createDoctypeDocument('root', '', '"a"b"'));
+  },
+  'serializing the DocumentType node itself with requireWellFormed: true throws': function() {
+    var doc = createDoctypeDocument('root', '"-//X//EN"><injected/', '');
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      new XMLSerializer().serializeToString(doc.doctype, false, null, { requireWellFormed: true });
+    });
+  },
+  'node.toString and NodeList.toString with requireWellFormed: true on a DocumentType payload throw': function() {
+    var doc = createDoctypeDocument('root', '', '"x.dtd" [<!ENTITY xxe SYSTEM "file:///etc/passwd">]');
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      doc.toString(false, null, { requireWellFormed: true });
+    });
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      doc.doctype.toString(false, null, { requireWellFormed: true });
+    });
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      doc.childNodes.toString(false, null, { requireWellFormed: true });
+    });
+  },
+  'requireWellFormed: true accepts well-formed literals': function() {
+    // a double quoted PubidLiteral may contain a single quote and line feeds,
+    // a single quoted SystemLiteral may contain a double quote
+    var doc = createDoctypeDocument('root', '"-//X//DTD a\'b' + String.fromCharCode(0x0A) + 'c//EN"', '\'sys"tem.dtd\'');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }),
+      '<!DOCTYPE root PUBLIC "-//X//DTD a\'b' + String.fromCharCode(0x0A) + 'c//EN" \'sys"tem.dtd\'><root/>');
+    doc = createDoctypeDocument('root', '', '');
+    doc.doctype.internalSubset = '<!ENTITY a "b">';
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }),
+      '<!DOCTYPE root [<!ENTITY a "b">]><root/>');
+  },
+  'requireWellFormed: false keeps the verbatim DocumentType output': function() {
+    var doc = createDoctypeDocument('root', '"-//X//EN"><injected/', '');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: false }),
+      '<!DOCTYPE root PUBLIC "-//X//EN"><injected/><root/>');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, null),
+      '<!DOCTYPE root PUBLIC "-//X//EN"><injected/><root/>');
+  }
+}).addBatch({
+  // The DocumentType name was not checked by the CVE-2026-41674 fix either: a ">" in the name
+  // closes the declaration early, and the name is a plain writable property.
+  // https://github.com/xmldom/xmldom/security/advisories/GHSA-27p8-2357-5qqv
+  'default: DocumentType with invalid name serializes verbatim - no throw': function() {
+    var doc = createDoctypeDocument('html', '', '');
+    doc.doctype.name = DOCTYPE_NAME_PAYLOAD;
+    var out = new XMLSerializer().serializeToString(doc);
+    assert.ok(out.indexOf('<!DOCTYPE html><script') === 0, out);
+  },
+  'requireWellFormed: true on DocumentType with ">" in name throws': function() {
+    var doc = createDoctypeDocument('html', '', '');
+    doc.doctype.name = DOCTYPE_NAME_PAYLOAD;
+    assertDoctypeRejected(doc);
+  },
+  'requireWellFormed: true on DocumentType with whitespace in name throws': function() {
+    var doc = createDoctypeDocument('html', '', '');
+    doc.doctype.name = 'ht ml';
+    assertDoctypeRejected(doc);
+  },
+  'requireWellFormed: true on a name passed to createDocumentType throws': function() {
+    assertDoctypeRejected(createDoctypeDocument(DOCTYPE_NAME_PAYLOAD, '', ''));
+    assertDoctypeRejected(createDoctypeDocument('html><!--INJECTED--', '', ''));
+    assertDoctypeRejected(createDoctypeDocument('html [<!ENTITY xxe SYSTEM "file:///etc/passwd">]', '', ''));
+    assertDoctypeRejected(createDoctypeDocument('', '', ''));
+    assertDoctypeRejected(createDoctypeDocument('html' + String.fromCharCode(0x0A), '', ''));
+  },
+  'requireWellFormed: true accepts valid XML names': function() {
+    var names = ['html', 'svg:svg', '_x-1.y', 'r\u00E9sum\u00E9'];
+    for (var i = 0; i < names.length; i++) {
+      var doc = createDoctypeDocument(names[i], '', '');
+      assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }),
+        '<!DOCTYPE ' + names[i] + '><root/>');
+    }
+  }
+}).addBatch({
+  // DOCTYPEs produced by the parser keep serializing with requireWellFormed: true
+  'parsed DOCTYPEs round-trip with requireWellFormed: true': function() {
+    var sources = [
+      '<!DOCTYPE x PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><x/>',
+      '<!DOCTYPE x PUBLIC "-//W3C//DTD HTML 4.01//EN"><x/>',
+      '<!DOCTYPE x PUBLIC \'-//W3C//DTD HTML 4.01//EN\' \'strict.dtd\'><x/>',
+      '<!DOCTYPE x SYSTEM "x.dtd"><x/>',
+      '<!DOCTYPE x SYSTEM \'x.dtd\'><x/>',
+      '<!DOCTYPE x SYSTEM \'"\'><x/>'
+    ];
+    for (var i = 0; i < sources.length; i++) {
+      var doc = new DOMParser().parseFromString(sources[i], 'text/xml');
+      assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }), sources[i]);
+    }
+  },
+  'a parsed DOCTYPE with an invalid PubidLiteral throws with requireWellFormed: true': function() {
+    var doc = new DOMParser().parseFromString('<!DOCTYPE x PUBLIC \'"\'><x/>', 'text/xml');
+    assert.strictEqual(new XMLSerializer().serializeToString(doc), '<!DOCTYPE x PUBLIC \'"\'><x/>');
+    assertDoctypeRejected(doc);
+  }
 }).run();
 
 // Serializing `doc` with requireWellFormed throws, so the payload never reaches the output.
@@ -327,8 +493,21 @@ function assertCommentRejected(doc) {
   });
 }
 
+// Serializing `doc` with requireWellFormed throws, so the DocumentType payload never reaches the output.
+function assertDoctypeRejected(doc) {
+  assertThrowsDOMException(INVALID_STATE_ERR, function() {
+    new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true });
+  });
+}
+
 function createRootDocument() {
   return new DOMImplementation().createDocument(null, 'root', null);
+}
+
+// Returns a document with a root element and a DocumentType created from the arguments as is.
+function createDoctypeDocument(name, publicId, systemId) {
+  var impl = new DOMImplementation();
+  return impl.createDocument(null, 'root', impl.createDocumentType(name, publicId, systemId));
 }
 
 // Serializes, then re-parses, and returns true if an <injected> element appears in the tree.
