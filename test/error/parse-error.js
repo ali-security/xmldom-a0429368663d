@@ -22,6 +22,13 @@ function StubDOMHandler(throwingMethod, ErrorClass) {
 	}.bind(this));
 	if (throwingMethod) {
 		this[throwingMethod] = function () {
+			if (throwingMethod === 'endCDATA') {
+				// The real endCDATA only leaves CDATA mode. Keep doing that, so the text the
+				// parser recovers after the error ("![CDATA[ raw ]]>") is not turned into a
+				// CDATASection by the inherited characters(): createCDATASection rejects
+				// data containing "]]>" (CVE-2026-34601).
+				DOMHandler.prototype.endCDATA.call(this);
+			}
 			throw new ErrorClass('StubDOMHandler throwing in ' + throwingMethod);
 		};
 	}

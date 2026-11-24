@@ -1,5 +1,12 @@
 var wows = require('vows');
+var assert = require('assert');
 var DOMParser = require('xmldom').DOMParser;
+var XMLSerializer = require('xmldom').XMLSerializer;
+var DOMImplementation = require('xmldom/dom').DOMImplementation;
+
+// the code is a literal so the vows report the missing check (and not a
+// TypeError) when DOMException codes are not exported
+var INVALID_STATE_ERR = 11;
 
 wows.describe('XML Serializer').addBatch({
   'text node containing "]]>"': function() {
@@ -12,4 +19,153 @@ wows.describe('XML Serializer').addBatch({
     //console.log(doc.documentElement.firstChild.toString(true))
     console.assert(doc.documentElement.firstChild.toString() == '<script></script>');
   },
+}).addBatch({
+  // CVE-2026-34601: CDATASection data containing "]]>" was serialized as is, so the
+  // terminator closed the section early and the rest of the data became live markup.
+  // https://github.com/xmldom/xmldom/security/advisories/GHSA-wh4c-j3r5-mjhp
+  'serializes a safe CDATASection unchanged': function() {
+    var doc = createRootDocument();
+    doc.documentElement.appendChild(doc.createCDATASection('safe data'));
+    assert.strictEqual(new XMLSerializer().serializeToString(doc.documentElement), '<root><![CDATA[safe data]]></root>');
+  },
+  'splits a CDATASection whose data contains "]]>"': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    assert.strictEqual(new XMLSerializer().serializeToString(doc.documentElement), '<root><![CDATA[foo]]]]><![CDATA[>bar]]></root>');
+  },
+  'splits multiple "]]>" occurrences': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'a]]>b]]>c';
+    doc.documentElement.appendChild(cdata);
+    assert.strictEqual(new XMLSerializer().serializeToString(doc.documentElement),
+      '<root><![CDATA[a]]]]><![CDATA[>b]]]]><![CDATA[>c]]></root>');
+  },
+  'split output round-trips through DOMParser to equivalent content': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    var serialized = new XMLSerializer().serializeToString(doc.documentElement);
+    var reparsed = new DOMParser().parseFromString(serialized, 'text/xml');
+    assert.strictEqual(reparsed.documentElement.textContent, 'foo]]>bar');
+  }
+}).addBatch({
+  'appendData introduces "]]>" safely': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    doc.documentElement.appendChild(cdata);
+    cdata.appendData(']]><injected/>');
+    assert.strictEqual(isInjected(doc.documentElement), false);
+  },
+  'insertData introduces "]]>" safely': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    doc.documentElement.appendChild(cdata);
+    cdata.insertData(4, ']]><injected/>');
+    assert.strictEqual(isInjected(doc.documentElement), false);
+  },
+  'replaceData introduces "]]>" safely': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe data');
+    doc.documentElement.appendChild(cdata);
+    cdata.replaceData(4, 5, ']]><injected/>');
+    assert.strictEqual(isInjected(doc.documentElement), false);
+  },
+  '.data assignment introduces "]]>" safely': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    doc.documentElement.appendChild(cdata);
+    cdata.data = 'evil]]><injected/>';
+    assert.strictEqual(isInjected(doc.documentElement), false);
+  },
+  '.textContent assignment introduces "]]>" safely': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    doc.documentElement.appendChild(cdata);
+    cdata.textContent = 'evil]]><injected/>';
+    assert.strictEqual(isInjected(doc.documentElement), false);
+  },
+  'node.toString of a mutated document is not injectable': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    doc.documentElement.appendChild(cdata);
+    cdata.appendData(']]><injected/>');
+    var reparsed = new DOMParser().parseFromString(doc.toString(), 'text/xml');
+    assert.strictEqual(reparsed.getElementsByTagName('injected').length, 0);
+  }
+}).addBatch({
+  'CDATA with "]]>" still splits when no options are passed (regression)': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    assert.strictEqual(new XMLSerializer().serializeToString(doc.documentElement), '<root><![CDATA[foo]]]]><![CDATA[>bar]]></root>');
+  },
+  'CDATA with "]]>" still splits when options is null (regression)': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    assert.strictEqual(new XMLSerializer().serializeToString(doc.documentElement, false, null, null),
+      '<root><![CDATA[foo]]]]><![CDATA[>bar]]></root>');
+  },
+  'requireWellFormed: true on a safe CDATA does not throw': function() {
+    var doc = createRootDocument();
+    doc.documentElement.appendChild(doc.createCDATASection('safe data'));
+    assert.strictEqual(new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true }),
+      '<root><![CDATA[safe data]]></root>');
+  },
+  'requireWellFormed: true on CDATA with "]]>" throws': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      new XMLSerializer().serializeToString(doc, false, null, { requireWellFormed: true });
+    });
+  },
+  'node.toString with requireWellFormed: true on CDATA with "]]>" throws': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.data = 'foo]]>bar';
+    doc.documentElement.appendChild(cdata);
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      doc.toString(false, null, { requireWellFormed: true });
+    });
+  },
+  'NodeList.toString with requireWellFormed: true on CDATA with "]]>" throws': function() {
+    var doc = createRootDocument();
+    var cdata = doc.createCDATASection('safe');
+    cdata.appendData(']]><injected/>');
+    doc.documentElement.appendChild(cdata);
+    assertThrowsDOMException(INVALID_STATE_ERR, function() {
+      doc.documentElement.childNodes.toString(false, null, { requireWellFormed: true });
+    });
+    assert.strictEqual(doc.documentElement.childNodes.toString(), '<![CDATA[safe]]]]><![CDATA[><injected/>]]>');
+  }
 }).run();
+
+function createRootDocument() {
+  return new DOMImplementation().createDocument(null, 'root', null);
+}
+
+// Serializes, then re-parses, and returns true if an <injected> element appears in the tree.
+function isInjected(root) {
+  var xml = new XMLSerializer().serializeToString(root);
+  var reparsed = new DOMParser().parseFromString(xml, 'text/xml');
+  return reparsed.getElementsByTagName('injected').length > 0;
+}
+
+function assertThrowsDOMException(code, fn) {
+  var thrown = null;
+  try {
+    fn();
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown, 'expected a DOMException with code ' + code + ' to be thrown');
+  assert.strictEqual(thrown.code, code, 'unexpected exception: ' + thrown);
+}
